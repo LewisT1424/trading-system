@@ -93,11 +93,16 @@ def price_features(prices: pl.DataFrame) -> pl.DataFrame:
     # Volume trend: positive slope over last 50 days (simple: recent vs earlier)
     vol_trend = _volume_trend(prices, window=50)
 
+    momentum_3m = _momentum(prices, lookback=90, col_name="momentum_3m")
+    momentum_1w = _momentum(prices, lookback=5,  col_name="momentum_1w")
+
     # Join everything onto latest
     result = (
         latest
         .join(momentum_6m, on="ticker", how="left")
+        .join(momentum_3m, on="ticker", how="left")
         .join(momentum_1m, on="ticker", how="left", suffix="_1m")
+        .join(momentum_1w, on="ticker", how="left")
         .join(vol_trend,   on="ticker", how="left")
         .with_columns([
             # C5 — % below 52-week high
@@ -125,7 +130,9 @@ def price_features(prices: pl.DataFrame) -> pl.DataFrame:
             "in_dip",
             "rsi_14",
             "momentum_6m",
+            "momentum_3m",
             "momentum_1m",
+            "momentum_1w",
             "volume_trend_50d",
         ])
     )
@@ -156,12 +163,14 @@ def _add_rsi(prices: pl.DataFrame, period: int = 14) -> pl.DataFrame:
     return prices.drop(["_delta", "_gain", "_loss", "_avg_gain", "_avg_loss"])
 
 
-def _momentum(prices: pl.DataFrame, lookback: int) -> pl.DataFrame:
+def _momentum(prices: pl.DataFrame, lookback: int, col_name: str | None = None) -> pl.DataFrame:
     """
-    Return a DataFrame with ticker and momentum_Nd column.
+    Return a DataFrame with ticker and momentum column.
     Momentum = (current_close - close_N_days_ago) / close_N_days_ago * 100
+    col_name: override the auto-generated column name.
     """
-    col_name = f"momentum_{lookback // 21}m" if lookback >= 21 else f"momentum_{lookback}d"
+    if col_name is None:
+        col_name = f"momentum_{lookback // 21}m" if lookback >= 21 else f"momentum_{lookback}d"
 
     prices_sorted = prices.sort(["ticker", "date"])
 
@@ -300,6 +309,18 @@ def fundamental_features(funds: pl.DataFrame) -> pl.DataFrame:
     # Asset and liability growth (C4): newest vs oldest of 4 quarters
     balance_growth = _balance_growth(funds_4q)
 
+    # C4 — asset/liability ratio direction: ratio newest vs oldest
+    ratio_trend = _ratio_trend(funds_4q)
+
+    # C3 — net income direction: newest vs oldest
+    net_income_direction = _net_income_direction(funds_4q)
+
+    # C8 — operating cash flow direction: newest vs oldest
+    cashflow_direction = _cashflow_direction(funds_4q)
+
+    # C7 — gross margin split: avg of newest 2Q vs avg of oldest 2Q
+    margin_split = _margin_split(funds_4q)
+
     # Gross margin average across 4 quarters
     margin_avg = (
         funds_4q
@@ -372,20 +393,16 @@ def fundamental_features(funds: pl.DataFrame) -> pl.DataFrame:
     )
 
     # Base: latest quarter fundamentals + .info fields
-    base = latest_q.select([
-        "ticker",
-        "gross_margin",
-        "net_margin",
-        "total_assets",
-        "total_liabilities",
-        "total_debt",
-        "cash",
-        "revenue",
-        "operating_income",
-        "net_income",
-        "trailing_pe",
-        "revenue_growth",
-    ]).rename({
+    # sector/industry — only include if present in the data (added after initial fetch)
+    base_cols = [
+        "ticker", "gross_margin", "net_margin", "total_assets",
+        "total_liabilities", "total_debt", "cash", "revenue",
+        "operating_income", "net_income", "trailing_pe", "revenue_growth",
+    ]
+    if "sector" in latest_q.columns:
+        base_cols += ["sector", "industry"]
+
+    base = latest_q.select(base_cols).rename({
         "gross_margin": "gross_margin_latest",
         "revenue": "revenue_latest",
     })
@@ -393,16 +410,20 @@ def fundamental_features(funds: pl.DataFrame) -> pl.DataFrame:
     # Join everything
     result = (
         base
-        .join(rev_yoy,       on="ticker", how="left")
-        .join(consistency,   on="ticker", how="left")
-        .join(trajectory,    on="ticker", how="left")
-        .join(balance_growth, on="ticker", how="left")
-        .join(margin_avg,    on="ticker", how="left")
-        .join(fcf_margin,    on="ticker", how="left")
+        .join(rev_yoy,            on="ticker", how="left")
+        .join(consistency,        on="ticker", how="left")
+        .join(trajectory,         on="ticker", how="left")
+        .join(balance_growth,     on="ticker", how="left")
+        .join(ratio_trend,        on="ticker", how="left")
+        .join(net_income_direction, on="ticker", how="left")
+        .join(cashflow_direction, on="ticker", how="left")
+        .join(margin_split,       on="ticker", how="left")
+        .join(margin_avg,         on="ticker", how="left")
+        .join(fcf_margin,         on="ticker", how="left")
         .join(mcap_bucket.select(["ticker", "market_cap_f", "market_cap_bucket"]),
               on="ticker", how="left")
-        .join(asset_mcap,    on="ticker", how="left")
-        .join(fcf_yield,     on="ticker", how="left")
+        .join(asset_mcap,         on="ticker", how="left")
+        .join(fcf_yield,          on="ticker", how="left")
         .rename({"market_cap_f": "market_cap"})
     )
 
@@ -518,6 +539,127 @@ def _balance_growth(funds_4q: pl.DataFrame) -> pl.DataFrame:
               .alias("liability_growth"),
         ])
         .select(["ticker", "asset_growth", "liability_growth"])
+    )
+
+
+
+def _ratio_trend(funds_4q: pl.DataFrame) -> pl.DataFrame:
+    """Asset/liability ratio direction: newest vs oldest of 4 quarters."""
+    newest = (
+        funds_4q
+        .with_columns(pl.int_range(pl.len()).over("ticker").alias("_rn"))
+        .filter(pl.col("_rn") == 0).drop("_rn")
+        .with_columns(
+            (pl.col("total_assets") / pl.col("total_liabilities")).alias("ratio_new")
+        )
+        .select(["ticker", "ratio_new"])
+    )
+    oldest = (
+        funds_4q.sort(["ticker", "period_dt"], descending=[False, False])
+        .with_columns(pl.int_range(pl.len()).over("ticker").alias("_rn"))
+        .filter(pl.col("_rn") == 0).drop("_rn")
+        .with_columns(
+            (pl.col("total_assets") / pl.col("total_liabilities")).alias("ratio_old")
+        )
+        .select(["ticker", "ratio_old"])
+    )
+    return (
+        newest.join(oldest, on="ticker", how="left")
+        .with_columns([
+            pl.when(
+                pl.col("ratio_new").is_not_null() & pl.col("ratio_old").is_not_null() &
+                (pl.col("ratio_old") > 0)
+            )
+            .then(pl.col("ratio_new") > pl.col("ratio_old"))
+            .otherwise(None)
+            .alias("asset_liability_ratio_improving")
+        ])
+        .select(["ticker", "asset_liability_ratio_improving"])
+    )
+
+
+def _net_income_direction(funds_4q: pl.DataFrame) -> pl.DataFrame:
+    """Net income direction: newest vs oldest of 4 quarters (C3)."""
+    newest = (
+        funds_4q
+        .with_columns(pl.int_range(pl.len()).over("ticker").alias("_rn"))
+        .filter(pl.col("_rn") == 0).drop("_rn")
+        .select(["ticker", pl.col("net_income").alias("ni_new")])
+    )
+    oldest = (
+        funds_4q.sort(["ticker", "period_dt"], descending=[False, False])
+        .with_columns(pl.int_range(pl.len()).over("ticker").alias("_rn"))
+        .filter(pl.col("_rn") == 0).drop("_rn")
+        .select(["ticker", pl.col("net_income").alias("ni_old")])
+    )
+    return (
+        newest.join(oldest, on="ticker", how="left")
+        .with_columns([
+            pl.when(pl.col("ni_new").is_not_null() & pl.col("ni_old").is_not_null())
+            .then(pl.col("ni_new") > pl.col("ni_old"))
+            .otherwise(None)
+            .alias("net_income_improving")
+        ])
+        .select(["ticker", "net_income_improving"])
+    )
+
+
+def _cashflow_direction(funds_4q: pl.DataFrame) -> pl.DataFrame:
+    """Operating cash flow direction: newest vs oldest of 4 quarters (C8)."""
+    newest = (
+        funds_4q
+        .with_columns(pl.int_range(pl.len()).over("ticker").alias("_rn"))
+        .filter(pl.col("_rn") == 0).drop("_rn")
+        .select(["ticker", pl.col("operating_cashflow").alias("cf_new")])
+    )
+    oldest = (
+        funds_4q.sort(["ticker", "period_dt"], descending=[False, False])
+        .with_columns(pl.int_range(pl.len()).over("ticker").alias("_rn"))
+        .filter(pl.col("_rn") == 0).drop("_rn")
+        .select(["ticker", pl.col("operating_cashflow").alias("cf_old")])
+    )
+    return (
+        newest.join(oldest, on="ticker", how="left")
+        .with_columns([
+            pl.when(pl.col("cf_new").is_not_null() & pl.col("cf_old").is_not_null())
+            .then(pl.col("cf_new") > pl.col("cf_old"))
+            .otherwise(None)
+            .alias("cashflow_improving")
+        ])
+        .select(["ticker", "cashflow_improving"])
+    )
+
+
+def _margin_split(funds_4q: pl.DataFrame) -> pl.DataFrame:
+    """
+    Gross margin quality: avg of newest 2 quarters vs avg of oldest 2 quarters.
+    Returns margin_recent_avg, margin_older_avg, and margin_improving boolean.
+    """
+    with_rn = funds_4q.with_columns(
+        pl.int_range(pl.len()).over("ticker").alias("_rn")
+    )
+    recent = (
+        with_rn.filter(pl.col("_rn") < 2)
+        .group_by("ticker")
+        .agg(pl.col("gross_margin").mean().alias("margin_recent_avg"))
+    )
+    older = (
+        with_rn.filter(pl.col("_rn") >= 2)
+        .group_by("ticker")
+        .agg(pl.col("gross_margin").mean().alias("margin_older_avg"))
+    )
+    return (
+        recent.join(older, on="ticker", how="left")
+        .with_columns([
+            pl.when(
+                pl.col("margin_recent_avg").is_not_null() &
+                pl.col("margin_older_avg").is_not_null()
+            )
+            .then(pl.col("margin_recent_avg") >= pl.col("margin_older_avg"))
+            .otherwise(None)
+            .alias("margin_stable_or_improving")
+        ])
+        .select(["ticker", "margin_recent_avg", "margin_older_avg", "margin_stable_or_improving"])
     )
 
 
