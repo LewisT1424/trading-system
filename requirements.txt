@@ -4,4 +4,4 @@ streamlit
 plotly
 requests
 certifi
-mlflow
+mlflowlxml
