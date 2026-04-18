@@ -4,4 +4,6 @@ streamlit
 plotly
 requests
 certifi
-mlflowlxml
+mlflow
+lxml
+html5lib
