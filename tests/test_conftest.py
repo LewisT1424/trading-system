@@ -1,0 +1,1 @@
+# conftest.py — shared fixtures can go here as the test suite grows
