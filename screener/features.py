@@ -186,8 +186,10 @@ def _momentum(prices: pl.DataFrame, lookback: int, col_name: str | None = None) 
         prices_sorted
         .group_by("ticker")
         .agg(
+            # slice(-lookback-1, 1) returns empty list if out of bounds — safe
             pl.col("close")
-              .get(pl.len() - lookback - 1)
+              .slice(-(lookback + 1), 1)
+              .first()
               .alias("close_past")
         )
     )
