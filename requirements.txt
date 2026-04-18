@@ -1,0 +1,7 @@
+yfinance
+polars
+streamlit
+plotly
+requests
+certifi
+mlflow
