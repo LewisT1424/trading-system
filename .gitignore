@@ -1,1 +1,21 @@
+# Data — regenerate with python setup.py && python data/fetch.py
 data/
+
+# Python
+__pycache__/
+*.py[cod]
+*.pyo
+.pytest_cache/
+
+# Env
+.env
+*.env
+
+# OS
+.DS_Store
+
+# MLflow
+mlruns/
+
+# Streamlit
+.streamlit/
