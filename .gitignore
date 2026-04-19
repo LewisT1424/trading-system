@@ -1,5 +1,6 @@
 # Data — regenerate with python setup.py && python data/fetch.py
 data/
+backtest/*.parquet
 
 # Python
 __pycache__/
