@@ -2,9 +2,10 @@
 backtest/engine.py
 Core backtesting engine.
 
-Two modes:
-    Backtest A — price signals only (C5, C6, C9), Apr 2019 – Apr 2026
-    Backtest B — full 9 criteria, Aug 2024 – Apr 2026
+Three modes:
+    Backtest A — price signals only (C5, C6, C9), May 2020 – Apr 2026
+    Backtest B — full 9 criteria, yfinance fundamentals (legacy, short window)
+    Backtest C — full 9 criteria, EDGAR fundamentals + constituent filter (primary)
 
 Design principles:
     - Every data access goes through get_prices_as_of(date) or get_funds_as_of(date)
@@ -14,8 +15,9 @@ Design principles:
 
 Usage:
     python backtest/engine.py --mode A --hold 3
-    python backtest/engine.py --mode B --hold 3
+    python backtest/engine.py --mode C --hold 3
     python backtest/engine.py --mode A --hold 1 3 6   # test multiple hold periods
+    python backtest/engine.py --mode C --hold 1 3 6   # full 9-criteria, all hold periods
 """
 
 import argparse
@@ -43,11 +45,17 @@ WARMUP_DAYS       = 252      # Trading days before first trade — ensures all s
                               # 200MA needs 200 days, 6M momentum needs 126 days
 
 # Backtest windows
-WINDOW_A_START     = datetime(2019, 4, 22)  # first available price date
-WINDOW_A_END       = datetime(2026, 4, 17)  # latest available price date
-FIRST_TRADE_DATE   = datetime(2020, 5, 1)   # after 252-day warmup from Apr 2019
-WINDOW_B_START     = datetime(2024, 8, 1)   # first fundamental data available
-WINDOW_B_END       = datetime(2026, 4, 17)
+WINDOW_A_START       = datetime(2010, 1, 4)   # earliest price data available
+WINDOW_A_END         = datetime(2026, 4, 17)  # latest available price date
+FIRST_TRADE_DATE     = datetime(2011, 1, 3)   # after 252-day warmup from Jan 2010
+WINDOW_B_START       = datetime(2024, 8, 1)   # first yfinance fundamental data
+WINDOW_B_END         = datetime(2026, 4, 17)
+WINDOW_C_START       = datetime(2010, 1, 4)   # EDGAR from 2009, price from 2010
+WINDOW_C_END         = datetime(2026, 4, 17)
+WINDOW_C_FIRST_TRADE = datetime(2011, 1, 3)   # same warmup as A
+
+# Rebalance frequency — switch between monthly and weekly
+REBALANCE_FREQ = "weekly"   # "monthly" or "weekly"
 
 # Walk-forward splits (for Backtest A — all after warmup)
 SPLITS = {
@@ -71,14 +79,37 @@ def get_prices_as_of(prices: pl.DataFrame, as_of: datetime) -> pl.DataFrame:
 
 def get_funds_as_of(funds: pl.DataFrame, as_of: datetime) -> pl.DataFrame:
     """
-    Return all fundamental rows with period STRICTLY BEFORE as_of.
-    Quarterly earnings are only available after the filing date,
-    not the period end date. yfinance uses period end date as the key,
-    which slightly understates the delay — we accept this limitation
-    and document it. In a production system this would use fillingDate.
+    Return all fundamental rows available STRICTLY BEFORE as_of.
+    For EDGAR data: filters on `filed` date — the actual SEC filing date.
+    For yfinance data: filters on `period` date (period end, slight lookahead).
+    True point-in-time: a Q3 report filed Nov 14 is not available until Nov 14.
     """
     as_of_str = as_of.strftime("%Y-%m-%d")
+    # EDGAR data has `filed` column — use it for true point-in-time
+    if "filed" in funds.columns:
+        return funds.filter(
+            pl.col("filed").is_not_null() &
+            (pl.col("filed") != "") &
+            (pl.col("filed") < as_of_str)
+        )
+    # yfinance fallback — uses period end date
     return funds.filter(pl.col("period") < as_of_str)
+
+
+def get_constituents_on_date(
+    as_of: datetime,
+    compositions: pl.DataFrame,
+) -> set[str]:
+    """
+    Return the set of S&P 500 tickers that were members on as_of date.
+    Uses the most recent monthly composition on or before as_of.
+    """
+    as_of_str = as_of.strftime("%Y-%m-%d")
+    valid = compositions.filter(pl.col("date") <= as_of_str)
+    if valid.is_empty():
+        valid = compositions.head(1)
+    row = valid.tail(1)
+    return set(row["tickers"][0])
 
 
 def get_benchmark_return(
@@ -104,27 +135,49 @@ def get_rebalance_dates(
     prices: pl.DataFrame,
     start: datetime,
     end: datetime,
+    freq: str = REBALANCE_FREQ,
 ) -> list[datetime]:
     """
-    Return the first trading day of each month between start and end.
+    Return rebalance dates between start and end.
+    freq: "monthly" = first trading day of each month
+          "weekly"  = first trading day of each ISO week
     Uses SPY as the reference calendar.
     """
     spy = prices.filter(pl.col("ticker") == BENCHMARK).sort("date")
-    monthly = (
-        spy
-        .with_columns([
-            pl.col("date").dt.year().alias("year"),
-            pl.col("date").dt.month().alias("month"),
-        ])
-        .group_by(["year", "month"])
-        .agg(pl.col("date").min().alias("rebalance_date"))
-        .sort("rebalance_date")
-        .filter(
-            (pl.col("rebalance_date") >= start) &
-            (pl.col("rebalance_date") <= end)
+
+    if freq == "weekly":
+        weekly = (
+            spy
+            .with_columns([
+                pl.col("date").dt.year().alias("year"),
+                pl.col("date").dt.iso_year().alias("iso_year"),
+                pl.col("date").dt.week().alias("week"),
+            ])
+            .group_by(["iso_year", "week"])
+            .agg(pl.col("date").min().alias("rebalance_date"))
+            .sort("rebalance_date")
+            .filter(
+                (pl.col("rebalance_date") >= start) &
+                (pl.col("rebalance_date") <= end)
+            )
         )
-    )
-    return monthly["rebalance_date"].to_list()
+        return weekly["rebalance_date"].to_list()
+    else:
+        monthly = (
+            spy
+            .with_columns([
+                pl.col("date").dt.year().alias("year"),
+                pl.col("date").dt.month().alias("month"),
+            ])
+            .group_by(["year", "month"])
+            .agg(pl.col("date").min().alias("rebalance_date"))
+            .sort("rebalance_date")
+            .filter(
+                (pl.col("rebalance_date") >= start) &
+                (pl.col("rebalance_date") <= end)
+            )
+        )
+        return monthly["rebalance_date"].to_list()
 
 
 def get_exit_date(
@@ -224,17 +277,61 @@ def score_full_signals(
     return scored
 
 
+def score_full_signals_edgar(
+    prices_pit: pl.DataFrame,
+    edgar_pit: pl.DataFrame,
+    as_of: datetime,
+    constituent_tickers: set[str],
+) -> pl.DataFrame:
+    """
+    Backtest C — score tickers on all 9 criteria using EDGAR fundamentals.
+
+    Key differences from score_full_signals():
+        1. Uses fundamental_features_edgar() — EDGAR data with filed date filter
+        2. Filters universe to S&P 500 constituents on as_of date
+        3. Intersects with available price data
+
+    Returns DataFrame with all criteria columns + score.
+    """
+    from features import price_features, fundamental_features_edgar
+    from run import score_tickers
+
+    if edgar_pit.is_empty():
+        return pl.DataFrame()
+
+    # Price features — full universe
+    pf = price_features(prices_pit)
+    pf = pf.filter(~pl.col("ticker").is_in(["SPY", "QQQ"]))
+
+    # Constituent filter — only score tickers in the index on this date
+    if constituent_tickers:
+        pf = pf.filter(pl.col("ticker").is_in(constituent_tickers))
+
+    if pf.is_empty():
+        return pl.DataFrame()
+
+    # EDGAR fundamental features — point-in-time
+    ff = fundamental_features_edgar(edgar_pit, as_of)
+
+    if ff.is_empty():
+        return pl.DataFrame()
+
+    scored = score_tickers(pf, ff)
+    return scored
+
+
 def select_top_n(
     signals: pl.DataFrame,
     n: int = TOP_N,
+    min_score: int = 1,
 ) -> pl.DataFrame:
     """
     Select top N tickers by score, with 1W momentum as tiebreaker.
-    Returns only tickers with score > 0.
+    min_score: minimum score threshold (use 7 for mode C, 1 for mode A).
     """
     return (
         signals
-        .filter(pl.col("score") > 0)
+        .filter(pl.col("score") >= min_score)
         .sort(["score", "momentum_1w"], descending=[True, True], nulls_last=True)
         .head(n)
     )
@@ -290,19 +387,32 @@ def run_backtest(
     hold_months: int,
     start: datetime,
     end: datetime,
+    compositions: pl.DataFrame | None = None,
+    freq: str = REBALANCE_FREQ,
 ) -> pl.DataFrame:
     """
     Run the full backtest loop.
+
+    Modes:
+        A — price signals only (C5, C6, C9)
+        B — full 9 criteria, yfinance fundamentals (legacy)
+        C — full 9 criteria, EDGAR fundamentals + S&P 500 constituent filter
 
     Returns a trade log DataFrame with columns:
         entry_date | exit_date | ticker | entry_price | exit_price |
         return_pct | net_return_pct | score | hold_months |
         benchmark_return | mode
     """
-    rebalance_dates = get_rebalance_dates(prices, start, end)
+    rebalance_dates = get_rebalance_dates(prices, start, end, freq=freq)
 
-    # Apply warmup — skip rebalance dates before FIRST_TRADE_DATE
-    first_trade = FIRST_TRADE_DATE if mode == "A" else WINDOW_B_START
+    # Warmup
+    if mode == "C":
+        first_trade = WINDOW_C_FIRST_TRADE
+    elif mode == "A":
+        first_trade = FIRST_TRADE_DATE
+    else:
+        first_trade = WINDOW_B_START
+
     tradeable_dates = [d for d in rebalance_dates if d >= first_trade]
 
     log.info(f"Mode {mode} | hold={hold_months}M | {len(rebalance_dates)} rebalance dates | "
@@ -312,7 +422,7 @@ def run_backtest(
     log.info(f"  Trading from: {first_trade.date()} | {len(tradeable_dates)} tradeable months")
 
     trades = []
-    open_positions: dict[str, dict] = {}  # ticker -> position info
+    open_positions: dict[str, dict] = {}
 
     for rebal_dt in rebalance_dates:
         # ── Point-in-time data ────────────────────────────────────────────
@@ -325,13 +435,25 @@ def run_backtest(
         # ── Score signals ─────────────────────────────────────────────────
         if mode == "A":
             signals = score_price_signals(prices_pit)
+        elif mode == "C":
+            # EDGAR fundamentals + constituent filter
+            constituent_tickers: set[str] = set()
+            if compositions is not None:
+                constituent_tickers = get_constituents_on_date(rebal_dt, compositions)
+            signals = score_full_signals_edgar(
+                prices_pit, funds_pit, rebal_dt, constituent_tickers
+            )
+            if signals.is_empty():
+                log.warning(f"  {rebal_dt.date()}: no signals (mode C)")
+                continue
         else:
             signals = score_full_signals(prices_pit, funds_pit)
             if signals.is_empty():
                 log.warning(f"  {rebal_dt.date()}: no signals generated (mode B, insufficient funds data)")
                 continue
 
-        top = select_top_n(signals, TOP_N)
+        min_score = 7 if mode == "C" else 1
+        top = select_top_n(signals, TOP_N, min_score=min_score)
 
         # ── Exit positions due for exit ───────────────────────────────────
         for ticker, pos in list(open_positions.items()):
@@ -413,36 +535,56 @@ def main():
     )
 
     parser = argparse.ArgumentParser()
-    parser.add_argument("--mode", choices=["A", "B", "both"], default="A")
+    parser.add_argument("--mode", choices=["A", "B", "C", "both"], default="A")
     parser.add_argument("--hold", type=int, nargs="+", default=[1, 3, 6])
     parser.add_argument("--split", choices=["full", "train", "validate", "test", "live"],
                         default="full")
+    parser.add_argument("--freq", choices=["weekly", "monthly"], default=REBALANCE_FREQ,
+                        help="Rebalance frequency (default: weekly)")
     args = parser.parse_args()
 
     log.info("Loading cached data...")
-    prices = pl.read_parquet(ROOT / "data" / "cache" / "prices.parquet")
-    funds  = pl.read_parquet(ROOT / "data" / "cache" / "fundamentals.parquet")
+    prices       = pl.read_parquet(ROOT / "data" / "cache" / "prices.parquet")
+    compositions = pl.read_parquet(ROOT / "data" / "cache" / "constituents.parquet")
 
-    modes = ["A", "B"] if args.mode == "both" else [args.mode]
+    # Load fundamentals — EDGAR for mode C, yfinance for mode B
+    edgar_path = ROOT / "data" / "cache" / "fundamentals_edgar.parquet"
+    yf_path    = ROOT / "data" / "cache" / "fundamentals.parquet"
+    edgar = pl.read_parquet(edgar_path) if edgar_path.exists() else pl.DataFrame()
+    funds = pl.read_parquet(yf_path)    if yf_path.exists()    else pl.DataFrame()
+
+    log.info(f"Prices:       {prices['ticker'].n_unique()} tickers, {len(prices):,} rows")
+    log.info(f"EDGAR funds:  {edgar['ticker'].n_unique() if not edgar.is_empty() else 0} tickers")
+    log.info(f"Constituents: {len(compositions)} monthly compositions")
+
+    modes = ["A", "B", "C"] if args.mode == "both" else [args.mode]
     results = {}
 
     for mode in modes:
         if mode == "A":
             start, end = WINDOW_A_START, WINDOW_A_END
+            fund_data  = funds
+        elif mode == "C":
+            start, end = WINDOW_C_START, WINDOW_C_END
+            fund_data  = edgar
         else:
             start, end = WINDOW_B_START, WINDOW_B_END
+            fund_data  = funds
 
-        if args.split != "full" and mode == "A":
+        if args.split != "full" and mode in ("A", "C"):
             start, end = SPLITS[args.split]
 
         for hold in args.hold:
             key = f"{mode}_{hold}M"
             log.info(f"\n{'='*60}")
             log.info(f"Running Backtest {key}")
-            trades = run_backtest(prices, funds, mode, hold, start, end)
+            trades = run_backtest(
+                prices, fund_data, mode, hold, start, end,
+                compositions=compositions if mode == "C" else None,
+                freq=args.freq,
+            )
             if not trades.is_empty():
                 results[key] = trades
-                # Save trade log
                 out = ROOT / "backtest" / f"trades_{key}.parquet"
                 out.parent.mkdir(exist_ok=True)
                 trades.write_parquet(out)
