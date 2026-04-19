@@ -186,8 +186,10 @@ def _momentum(prices: pl.DataFrame, lookback: int, col_name: str | None = None) 
         prices_sorted
         .group_by("ticker")
         .agg(
+            # slice(-lookback-1, 1) returns empty list if out of bounds — safe
             pl.col("close")
-              .get(pl.len() - lookback - 1)
+              .slice(-(lookback + 1), 1)
+              .first()
               .alias("close_past")
         )
     )
@@ -662,6 +664,281 @@ def _margin_split(funds_4q: pl.DataFrame) -> pl.DataFrame:
         .select(["ticker", "margin_recent_avg", "margin_older_avg", "margin_stable_or_improving"])
     )
 
+
+
+
+# ── EDGAR fundamental features (point-in-time, for backtesting) ───────────────
+
+def fundamental_features_edgar(
+    edgar: pl.DataFrame,
+    as_of: "datetime",
+) -> pl.DataFrame:
+    """
+    Compute fundamental features from EDGAR data as of a specific date.
+
+    Key difference from fundamental_features():
+        - Filters on `filed` date (true point-in-time, no lookahead)
+        - Uses EDGAR fields directly (revenue, gross_profit, net_income, etc.)
+        - Returns the same output columns as fundamental_features() for
+          compatibility with score_tickers() in run.py
+
+    C1  — revenue_growth_yoy + gross_margin (asset-light path only in backtest)
+    C2  — revenue_consistency (3/4 quarters positive)
+    C3  — net_income_improving (newest vs oldest of 4)
+    C4  — asset_liability_ratio_improving
+    C7  — gross_margin_latest + margin_stable_or_improving
+    C8  — cashflow_improving
+    """
+    from datetime import datetime as dt
+
+    as_of_str = as_of.strftime("%Y-%m-%d") if hasattr(as_of, "strftime") else str(as_of)
+
+    # ── Point-in-time filter: only use filings available on rebal date ────
+    pit = edgar.filter(pl.col("filed") <= as_of_str)
+
+    if pit.is_empty():
+        return pl.DataFrame()
+
+    # ── Sort newest first, take 4 most recent quarters per ticker ─────────
+    pit = (
+        pit
+        .sort(["ticker", "period_end"], descending=[False, True])
+        .with_columns(pl.int_range(pl.len()).over("ticker").alias("_rn"))
+        .filter(pl.col("_rn") < 4)
+        .drop("_rn")
+    )
+
+    if pit.is_empty():
+        return pl.DataFrame()
+
+    # ── Revenue consistency: C2 — at least 3/4 quarters positive ─────────
+    consistency = (
+        pit
+        .group_by("ticker")
+        .agg([
+            (pl.col("revenue") > 0).sum().alias("pos_quarters"),
+            pl.len().alias("total_quarters"),
+        ])
+        .with_columns(
+            (pl.col("pos_quarters") / pl.col("total_quarters"))
+            .alias("revenue_consistency")
+        )
+        .select(["ticker", "revenue_consistency"])
+    )
+
+    # ── Revenue growth YoY: newest vs oldest of 4 ─────────────────────────
+    newest_rev = (
+        pit
+        .with_columns(pl.int_range(pl.len()).over("ticker").alias("_rn"))
+        .filter(pl.col("_rn") == 0).drop("_rn")
+        .select(["ticker", pl.col("revenue").alias("rev_new")])
+    )
+    oldest_rev = (
+        pit.sort(["ticker", "period_end"], descending=[False, False])
+        .with_columns(pl.int_range(pl.len()).over("ticker").alias("_rn"))
+        .filter(pl.col("_rn") == 0).drop("_rn")
+        .select(["ticker", pl.col("revenue").alias("rev_old")])
+    )
+    rev_growth = (
+        newest_rev.join(oldest_rev, on="ticker", how="left")
+        .with_columns(
+            pl.when(
+                pl.col("rev_old").is_not_null() & (pl.col("rev_old") > 0)
+            )
+            .then((pl.col("rev_new") - pl.col("rev_old")) / pl.col("rev_old"))
+            .otherwise(None)
+            .alias("revenue_growth_yoy")
+        )
+        .select(["ticker", "revenue_growth_yoy"])
+    )
+
+    # ── Net income direction: C3 ──────────────────────────────────────────
+    newest_ni = (
+        pit
+        .with_columns(pl.int_range(pl.len()).over("ticker").alias("_rn"))
+        .filter(pl.col("_rn") == 0).drop("_rn")
+        .select(["ticker", pl.col("net_income").alias("ni_new")])
+    )
+    oldest_ni = (
+        pit.sort(["ticker", "period_end"], descending=[False, False])
+        .with_columns(pl.int_range(pl.len()).over("ticker").alias("_rn"))
+        .filter(pl.col("_rn") == 0).drop("_rn")
+        .select(["ticker", pl.col("net_income").alias("ni_old")])
+    )
+    ni_direction = (
+        newest_ni.join(oldest_ni, on="ticker", how="left")
+        .with_columns(
+            pl.when(pl.col("ni_new").is_not_null() & pl.col("ni_old").is_not_null())
+            .then(pl.col("ni_new") > pl.col("ni_old"))
+            .otherwise(None)
+            .alias("net_income_improving")
+        )
+        .select(["ticker", "net_income_improving"])
+    )
+
+    # ── Asset/liability ratio trend: C4 ──────────────────────────────────
+    newest_bal = (
+        pit
+        .with_columns(pl.int_range(pl.len()).over("ticker").alias("_rn"))
+        .filter(pl.col("_rn") == 0).drop("_rn")
+        .with_columns(
+            (pl.col("total_assets") / pl.col("total_liabilities")).alias("ratio_new")
+        )
+        .select(["ticker", "ratio_new",
+                 pl.col("total_assets").alias("assets_new"),
+                 pl.col("total_liabilities").alias("liab_new")])
+    )
+    oldest_bal = (
+        pit.sort(["ticker", "period_end"], descending=[False, False])
+        .with_columns(pl.int_range(pl.len()).over("ticker").alias("_rn"))
+        .filter(pl.col("_rn") == 0).drop("_rn")
+        .with_columns(
+            (pl.col("total_assets") / pl.col("total_liabilities")).alias("ratio_old")
+        )
+        .select(["ticker", "ratio_old",
+                 pl.col("total_assets").alias("assets_old"),
+                 pl.col("total_liabilities").alias("liab_old")])
+    )
+    balance = (
+        newest_bal.join(oldest_bal, on="ticker", how="left")
+        .with_columns([
+            pl.when(
+                pl.col("ratio_new").is_not_null() & pl.col("ratio_old").is_not_null() &
+                (pl.col("ratio_old") > 0)
+            )
+            .then(pl.col("ratio_new") > pl.col("ratio_old"))
+            .otherwise(None)
+            .alias("asset_liability_ratio_improving"),
+
+            pl.when(pl.col("assets_old").is_not_null() & (pl.col("assets_old") > 0))
+            .then((pl.col("assets_new") - pl.col("assets_old")) / pl.col("assets_old"))
+            .otherwise(None)
+            .alias("asset_growth"),
+
+            pl.when(pl.col("liab_old").is_not_null() & (pl.col("liab_old") > 0))
+            .then((pl.col("liab_new") - pl.col("liab_old")) / pl.col("liab_old"))
+            .otherwise(None)
+            .alias("liability_growth"),
+        ])
+        .select(["ticker", "asset_liability_ratio_improving",
+                 "asset_growth", "liability_growth"])
+    )
+
+    # ── Cashflow direction: C8 ────────────────────────────────────────────
+    newest_cf = (
+        pit
+        .with_columns(pl.int_range(pl.len()).over("ticker").alias("_rn"))
+        .filter(pl.col("_rn") == 0).drop("_rn")
+        .select(["ticker", pl.col("operating_cashflow").alias("cf_new")])
+    )
+    oldest_cf = (
+        pit.sort(["ticker", "period_end"], descending=[False, False])
+        .with_columns(pl.int_range(pl.len()).over("ticker").alias("_rn"))
+        .filter(pl.col("_rn") == 0).drop("_rn")
+        .select(["ticker", pl.col("operating_cashflow").alias("cf_old")])
+    )
+    cf_direction = (
+        newest_cf.join(oldest_cf, on="ticker", how="left")
+        .with_columns(
+            pl.when(pl.col("cf_new").is_not_null() & pl.col("cf_old").is_not_null())
+            .then(pl.col("cf_new") > pl.col("cf_old"))
+            .otherwise(None)
+            .alias("cashflow_improving")
+        )
+        .select(["ticker", "cashflow_improving"])
+    )
+
+    # ── Gross margin quality: C7 ──────────────────────────────────────────
+    latest_margin = (
+        pit
+        .with_columns(pl.int_range(pl.len()).over("ticker").alias("_rn"))
+        .filter(pl.col("_rn") == 0).drop("_rn")
+        .select(["ticker", pl.col("gross_margin").alias("gross_margin_latest")])
+    )
+    with_rn = pit.with_columns(pl.int_range(pl.len()).over("ticker").alias("_rn"))
+    margin_recent = (
+        with_rn.filter(pl.col("_rn") < 2)
+        .group_by("ticker")
+        .agg(pl.col("gross_margin").mean().alias("margin_recent_avg"))
+    )
+    margin_older = (
+        with_rn.filter(pl.col("_rn") >= 2)
+        .group_by("ticker")
+        .agg(pl.col("gross_margin").mean().alias("margin_older_avg"))
+    )
+    margin_quality = (
+        latest_margin
+        .join(margin_recent, on="ticker", how="left")
+        .join(margin_older,  on="ticker", how="left")
+        .with_columns(
+            pl.when(
+                pl.col("margin_recent_avg").is_not_null() &
+                pl.col("margin_older_avg").is_not_null()
+            )
+            .then(pl.col("margin_recent_avg") >= pl.col("margin_older_avg"))
+            .otherwise(None)
+            .alias("margin_stable_or_improving")
+        )
+        .with_columns(
+            pl.col("margin_recent_avg").alias("gross_margin_avg")
+        )
+        .select(["ticker", "gross_margin_latest", "gross_margin_avg",
+                 "margin_recent_avg", "margin_older_avg",
+                 "margin_stable_or_improving"])
+    )
+
+    # ── Revenue trajectory: for C3 direction ─────────────────────────────
+    trajectory = (
+        newest_rev.join(oldest_rev, on="ticker", how="left")
+        .with_columns(
+            pl.when(pl.col("rev_old").is_not_null() & (pl.col("rev_old") != 0))
+            .then(
+                pl.when(
+                    (pl.col("rev_new") - pl.col("rev_old")) / pl.col("rev_old").abs() > 0.05
+                ).then(1)
+                .when(
+                    (pl.col("rev_new") - pl.col("rev_old")) / pl.col("rev_old").abs() < -0.05
+                ).then(-1)
+                .otherwise(0)
+            )
+            .otherwise(None)
+            .alias("revenue_trajectory")
+        )
+        .select(["ticker", "revenue_trajectory"])
+    )
+
+    # ── Assemble result ───────────────────────────────────────────────────
+    # Start from tickers that have fundamental data
+    tickers = pit.select("ticker").unique()
+
+    result = (
+        tickers
+        .join(consistency,    on="ticker", how="left")
+        .join(rev_growth,     on="ticker", how="left")
+        .join(trajectory,     on="ticker", how="left")
+        .join(ni_direction,   on="ticker", how="left")
+        .join(balance,        on="ticker", how="left")
+        .join(cf_direction,   on="ticker", how="left")
+        .join(margin_quality, on="ticker", how="left")
+        # Stub columns that yfinance version has but EDGAR doesn't
+        # These are live-only features (require market cap or analyst data)
+        .with_columns([
+            pl.lit(None).cast(pl.Float64).alias("market_cap"),
+            pl.lit(None).cast(pl.Float64).alias("asset_to_mcap_ratio"),
+            pl.lit(None).cast(pl.Float64).alias("fcf_margin"),
+            pl.lit(None).cast(pl.Float64).alias("fcf_yield"),
+            pl.lit(None).cast(pl.Float64).alias("trailing_pe"),
+            pl.lit(None).cast(pl.Float64).alias("revenue_growth_ttm"),
+            pl.lit(2).cast(pl.Int32).alias("market_cap_bucket"),  # default mid-cap
+            pl.lit(None).cast(pl.Float64).alias("margin_trajectory"),
+            pl.lit(None).cast(pl.String).alias("sector"),
+            pl.lit(None).cast(pl.String).alias("industry"),
+        ])
+    )
+
+    log.info(f"EDGAR fundamental features computed: {len(result)} tickers "
+             f"(as of {as_of_str})")
+    return result
 
 # ── Main ──────────────────────────────────────────────────────────────────────
 
