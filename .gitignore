@@ -1,6 +1,8 @@
 # Data — regenerate with python setup.py && python data/fetch.py
 data/
 backtest/*.parquet
+screener/output/
+paper_trading_log.csv
 
 # Python
 __pycache__/
