@@ -9,8 +9,10 @@ strictly at signal date (no lookahead) and assigns a binary label:
     label = 1 if (return_pct - benchmark_return) > 10 percentage points
     label = 0 otherwise
 
-This dataset is training data for the XGBoost false-positive filter.
-It is NOT the model. The model is built after paper trading gate passes.
+Restructured to iterate by unique signal date (772) rather than by signal
+(3,882) — calls price_features() and fundamental_features_edgar() once per
+date across all tickers, then filters to the signals that fired that date.
+This is ~5x faster than the original per-signal loop.
 
 Output: research/data/ml_labels.parquet
 
@@ -21,7 +23,7 @@ Usage:
 import sys
 import logging
 from pathlib import Path
-from datetime import datetime, timedelta
+from datetime import datetime
 
 import polars as pl
 import numpy as np
@@ -29,10 +31,8 @@ import numpy as np
 ROOT = Path(__file__).parent.parent
 sys.path.insert(0, str(ROOT))
 
-# Import the lookahead firewall directly from the backtest engine.
-# Do not reimplement these functions — the same logic that protects
-# the backtest protects the feature engineering.
 from backtest.engine import get_prices_as_of, get_funds_as_of
+from screener.features import price_features, fundamental_features_edgar
 
 logging.basicConfig(
     level=logging.INFO,
@@ -43,35 +43,23 @@ log = logging.getLogger(__name__)
 
 # ── Constants ─────────────────────────────────────────────────────────────────
 
-ALPHA_THRESHOLD = 10.0   # Label = 1 if alpha > this many percentage points
+ALPHA_THRESHOLD = 10.0
 OUTPUT_DIR      = ROOT / "research" / "data"
 OUTPUT_FILE     = OUTPUT_DIR / "ml_labels.parquet"
-
 
 # ── Load data ─────────────────────────────────────────────────────────────────
 
 def load_data():
     log.info("Loading trades, prices, fundamentals...")
-
     trades = pl.read_parquet(ROOT / "backtest" / "trades_A_6M.parquet")
     prices = pl.read_parquet(ROOT / "data" / "cache" / "prices.parquet")
     funds  = pl.read_parquet(ROOT / "data" / "cache" / "fundamentals_edgar.parquet")
-
-    log.info(f"Trades:         {trades.shape}")
-    log.info(f"Prices:         {prices.shape}")
-    log.info(f"Fundamentals:   {funds.shape}")
-
+    log.info(f"Trades: {trades.shape}  Prices: {prices.shape}  Funds: {funds.shape}")
     return trades, prices, funds
-
 
 # ── Label construction ────────────────────────────────────────────────────────
 
 def build_labels(trades: pl.DataFrame) -> pl.DataFrame:
-    """
-    Compute alpha and assign binary label.
-    Alpha = stock return - benchmark return over the hold period.
-    Label = 1 if alpha > ALPHA_THRESHOLD, 0 otherwise.
-    """
     return trades.with_columns([
         (pl.col("return_pct") - pl.col("benchmark_return")).alias("alpha"),
         ((pl.col("return_pct") - pl.col("benchmark_return")) > ALPHA_THRESHOLD)
@@ -79,263 +67,200 @@ def build_labels(trades: pl.DataFrame) -> pl.DataFrame:
             .alias("label")
     ])
 
+# ── Volatility features ───────────────────────────────────────────────────────
 
-# ── Price features ────────────────────────────────────────────────────────────
-
-def compute_price_features(
-    ticker: str,
-    signal_date: datetime,
-    prices: pl.DataFrame
-) -> dict:
+def compute_volatility_features(px_ticker: pl.DataFrame) -> dict:
     """
-    Compute price-based features for one ticker at one signal date.
-    Uses get_prices_as_of to enforce the lookahead firewall.
-    All features use only data strictly before signal_date.
+    Compute stock-level volatility from single-ticker price series.
+    px_ticker: prices for one ticker strictly before signal date, sorted by date.
     """
-    # Filter to this ticker, strictly before signal date
-    px = get_prices_as_of(prices, signal_date).filter(
-        pl.col("ticker") == ticker
-    ).sort("date")
+    if len(px_ticker) < 21:
+        return {"stock_vol_20d": None, "stock_vol_63d": None, "vol_ratio": None}
 
-    # Need at least 200 rows for 200MA — return nulls if insufficient
-    if len(px) < 200:
-        return {
-            "momentum_6m":        None,
-            "momentum_3m":        None,
-            "momentum_1m":        None,
-            "above_200ma":        None,
-            "pct_below_52w_high": None,
-            "rsi_14":             None,
-            "volume_trend_20d":   None,
-            "spy_above_200ma":    None,
-        }
+    close   = px_ticker["close"].to_numpy()
+    returns = np.diff(close) / close[:-1]
 
-    close  = px["close"].to_numpy()
-    volume = px["volume"].to_numpy()
-
-    # Momentum — returns over lookback windows
-    # 126 trading days ≈ 6 months, 63 ≈ 3 months, 21 ≈ 1 month
-    def momentum(n: int) -> float | None:
-        if len(close) < n + 1:
-            return None
-        return float((close[-1] / close[-n] - 1) * 100)
-
-    momentum_6m = momentum(126)
-    momentum_3m = momentum(63)
-    momentum_1m = momentum(21)
-
-    # 200-day moving average
-    ma_200      = float(np.mean(close[-200:]))
-    above_200ma = int(close[-1] > ma_200)
-
-    # % below 52-week high (252 trading days)
-    high_252 = float(np.max(close[-252:])) if len(close) >= 252 else float(np.max(close))
-    pct_below_52w_high = float((close[-1] / high_252 - 1) * 100)
-
-    # RSI(14) — relative strength index
-    # Measures momentum quality: overbought (>70) vs oversold (<30)
-    if len(close) >= 15:
-        deltas = np.diff(close[-15:])
-        gains  = np.where(deltas > 0, deltas, 0)
-        losses = np.where(deltas < 0, -deltas, 0)
-        avg_gain = np.mean(gains)
-        avg_loss = np.mean(losses)
-        if avg_loss == 0:
-            rsi_14 = 100.0
-        else:
-            rs     = avg_gain / avg_loss
-            rsi_14 = float(100 - (100 / (1 + rs)))
-    else:
-        rsi_14 = None
-
-    # Volume trend — slope of 20-day volume (positive = expanding)
-    if len(volume) >= 20:
-        vol_20      = volume[-20:].astype(float)
-        x           = np.arange(len(vol_20))
-        volume_trend_20d = float(np.polyfit(x, vol_20, 1)[0])
-    else:
-        volume_trend_20d = None
+    vol_20d   = float(np.std(returns[-20:])) if len(returns) >= 20 else None
+    vol_63d   = float(np.std(returns[-63:])) if len(returns) >= 63 else None
+    vol_ratio = float(vol_20d / vol_63d) if (vol_20d and vol_63d and vol_63d > 0) else None
 
     return {
-        "momentum_6m":        momentum_6m,
-        "momentum_3m":        momentum_3m,
-        "momentum_1m":        momentum_1m,
-        "above_200ma":        above_200ma,
-        "pct_below_52w_high": pct_below_52w_high,
-        "rsi_14":             rsi_14,
-        "volume_trend_20d":   volume_trend_20d,
+        "stock_vol_20d": vol_20d,
+        "stock_vol_63d": vol_63d,
+        "vol_ratio":     vol_ratio,
     }
 
+# ── Regime features ───────────────────────────────────────────────────────────
 
-# ── Market regime features ────────────────────────────────────────────────────
-
-def compute_regime_features(
-    signal_date: datetime,
-    prices: pl.DataFrame
-) -> dict:
+def compute_regime_features(px_spy: pl.DataFrame) -> dict:
     """
-    Compute market-wide regime features at signal date.
-    Uses SPY as the market proxy.
-    """
-    spy_px = get_prices_as_of(prices, signal_date).filter(
-        pl.col("ticker") == "SPY"
-    ).sort("date")
-
-    if len(spy_px) < 200:
-        return {"spy_above_200ma": None, "spy_momentum_6m": None}
-
-    spy_close    = spy_px["close"].to_numpy()
-    spy_ma200    = float(np.mean(spy_close[-200:]))
-    spy_above_200ma   = int(spy_close[-1] > spy_ma200)
-    spy_momentum_6m   = float((spy_close[-1] / spy_close[-126] - 1) * 100) \
-                        if len(spy_close) >= 126 else None
-
-    return {
-        "spy_above_200ma":  spy_above_200ma,
-        "spy_momentum_6m":  spy_momentum_6m,
-    }
-
-
-# ── Fundamental features ──────────────────────────────────────────────────────
-
-def compute_fundamental_features(
-    ticker: str,
-    signal_date: datetime,
-    funds: pl.DataFrame
-) -> dict:
-    """
-    Compute fundamental features for one ticker at one signal date.
-    Uses get_funds_as_of to enforce point-in-time filing dates.
-    Only EDGAR data filed strictly before signal_date is used.
+    Compute market regime features from SPY prices strictly before signal date.
     """
     empty = {
-        "gross_margin":        None,
-        "net_margin":          None,
-        "revenue_growth":      None,
-        "net_income_trend":    None,
-        "asset_liability_ratio": None,
-        "operating_cf_trend":  None,
+        "market_vol_20d":  None,
+        "spy_momentum_3m": None,
+        "spy_momentum_1m": None,
+        "market_drawdown": None,
     }
 
-    f = get_funds_as_of(funds, signal_date).filter(
-        pl.col("ticker") == ticker
-    ).sort("period_end")
-
-    # Need at least 2 quarters to compute trends
-    if len(f) < 2:
+    if len(px_spy) < 200:
         return empty
 
-    # Most recent quarter
-    latest = f[-1]
+    close   = px_spy["close"].to_numpy()
+    returns = np.diff(close) / close[:-1]
 
-    gross_margin = float(latest["gross_margin"][0]) \
-                   if latest["gross_margin"][0] is not None else None
-    net_margin   = float(latest["net_margin"][0]) \
-                   if latest["net_margin"][0] is not None else None
-
-    # Revenue growth — newest vs oldest available quarter
-    rev_new = latest["revenue"][0]
-    rev_old = f[0]["revenue"][0]
-    revenue_growth = float((rev_new / rev_old - 1) * 100) \
-                     if (rev_new and rev_old and rev_old != 0) else None
-
-    # Net income trend — positive = improving
-    ni_new = latest["net_income"][0]
-    ni_old = f[0]["net_income"][0]
-    net_income_trend = int(ni_new > ni_old) \
-                       if (ni_new is not None and ni_old is not None) else None
-
-    # Asset/liability ratio — latest
-    assets = latest["total_assets"][0]
-    liabs  = latest["total_liabilities"][0]
-    asset_liability_ratio = float(assets / liabs) \
-                            if (assets and liabs and liabs != 0) else None
-
-    # Operating cashflow trend
-    cf_new = latest["operating_cashflow"][0]
-    cf_old = f[0]["operating_cashflow"][0]
-    operating_cf_trend = int(cf_new > cf_old) \
-                         if (cf_new is not None and cf_old is not None) else None
+    market_vol_20d  = float(np.std(returns[-20:])) if len(returns) >= 20 else None
+    spy_momentum_3m = float((close[-1] / close[-63]  - 1) * 100) if len(close) >= 63  else None
+    spy_momentum_1m = float((close[-1] / close[-21]  - 1) * 100) if len(close) >= 21  else None
+    high_252        = float(np.max(close[-252:])) if len(close) >= 252 else float(np.max(close))
+    market_drawdown = float((close[-1] / high_252 - 1) * 100)
 
     return {
-        "gross_margin":          gross_margin,
-        "net_margin":            net_margin,
-        "revenue_growth":        revenue_growth,
-        "net_income_trend":      net_income_trend,
-        "asset_liability_ratio": asset_liability_ratio,
-        "operating_cf_trend":    operating_cf_trend,
+        "market_vol_20d":  market_vol_20d,
+        "spy_momentum_3m": spy_momentum_3m,
+        "spy_momentum_1m": spy_momentum_1m,
+        "market_drawdown": market_drawdown,
     }
 
+# ── Time/cycle features ───────────────────────────────────────────────────────
+
+def compute_time_features(signal_date: datetime) -> dict:
+    """
+    Calendar and cycle features from signal date.
+    month: seasonality effects
+    year_normalized: position in sample 0=2011 to 1=2026
+    """
+    return {
+        "month":           signal_date.month,
+        "year_normalized": round((signal_date.year - 2011) / (2026 - 2011), 4),
+    }
 
 # ── Main build loop ───────────────────────────────────────────────────────────
 
-def build_dataset(trades: pl.DataFrame, prices: pl.DataFrame, funds: pl.DataFrame) -> pl.DataFrame:
+def build_dataset(
+    trades: pl.DataFrame,
+    prices: pl.DataFrame,
+    funds:  pl.DataFrame,
+) -> pl.DataFrame:
     """
-    For every signal in the trades file, compute all features at signal_date.
-    Returns a DataFrame with one row per signal, all features, and the label.
+    Iterate by unique signal date (772 iterations instead of 3,882).
+    For each date: compute features once for all tickers, join onto signals.
     """
-    rows = []
-    total = len(trades)
+    signal_dates = trades["signal_date"].unique().sort().to_list()
+    total        = len(signal_dates)
+    rows         = []
 
-    for i, row in enumerate(trades.iter_rows(named=True)):
-        if i % 200 == 0:
-            log.info(f"Processing signal {i+1}/{total} ({i/total*100:.0f}%)")
+    # Pre-filter SPY for regime features
+    spy_all = prices.filter(pl.col("ticker") == "SPY").sort("date")
 
-        ticker      = row["ticker"]
-        signal_date = row["signal_date"]
+    for i, signal_date in enumerate(signal_dates):
+        if i % 100 == 0:
+            log.info(
+                f"Processing date {i+1}/{total} — "
+                f"{signal_date.date()} ({i/total*100:.0f}%)"
+            )
 
-        # Price features — point-in-time via get_prices_as_of
-        price_feats  = compute_price_features(ticker, signal_date, prices)
+        # Signals on this date
+        signals_today = trades.filter(pl.col("signal_date") == signal_date)
 
-        # Regime features — SPY state at signal date
-        regime_feats = compute_regime_features(signal_date, prices)
+        # Point-in-time price data — all tickers
+        px_pit = get_prices_as_of(prices, signal_date)
 
-        # Fundamental features — point-in-time via get_funds_as_of
-        fund_feats   = compute_fundamental_features(ticker, signal_date, funds)
+        # Price features — one call for all tickers
+        try:
+            pf = price_features(px_pit)
+        except Exception as e:
+            log.warning(f"price_features failed on {signal_date}: {e}")
+            pf = pl.DataFrame()
 
-        # Combine everything into one row
-        record = {
-            # Identifiers
-            "ticker":      ticker,
-            "signal_date": signal_date,
-            "label":       row["label"],
-            "alpha":       row["alpha"],
-            # From trades — already available at signal time
-            "score":       row["score"],
-            # Price features
-            **price_feats,
-            # Regime features
-            **regime_feats,
-            # Fundamental features
-            **fund_feats,
-        }
+        # Fundamental features — one call for all tickers
+        try:
+            ff = fundamental_features_edgar(funds, signal_date)
+        except Exception as e:
+            log.warning(f"fundamental_features_edgar failed on {signal_date}: {e}")
+            ff = pl.DataFrame()
 
-        rows.append(record)
+        # Regime features — SPY only
+        spy_pit = spy_all.filter(pl.col("date") < signal_date)
+        regime  = compute_regime_features(spy_pit)
+
+        # Time features
+        time_feats = compute_time_features(signal_date)
+
+        # Per-ticker assembly
+        for row in signals_today.iter_rows(named=True):
+            ticker = row["ticker"]
+
+            # Price features for this ticker
+            pf_ticker = {}
+            if len(pf) > 0 and "ticker" in pf.columns:
+                pf_row = pf.filter(pl.col("ticker") == ticker)
+                if len(pf_row) > 0:
+                    pf_ticker = pf_row.to_dicts()[0]
+                    pf_ticker.pop("ticker", None)
+
+            # Fundamental features for this ticker
+            ff_ticker = {}
+            if len(ff) > 0 and "ticker" in ff.columns:
+                ff_row = ff.filter(pl.col("ticker") == ticker)
+                if len(ff_row) > 0:
+                    ff_ticker = ff_row.to_dicts()[0]
+                    ff_ticker.pop("ticker", None)
+
+            # Volatility — single ticker price series
+            px_ticker = px_pit.filter(pl.col("ticker") == ticker).sort("date")
+            vol_feats = compute_volatility_features(px_ticker)
+
+            record = {
+                # Identifiers
+                "ticker":      ticker,
+                "signal_date": signal_date,
+                "label":       row["label"],
+                "alpha":       row["alpha"],
+                "score":       row["score"],
+                # Price features
+                **pf_ticker,
+                # Fundamental features
+                **ff_ticker,
+                # Volatility
+                **vol_feats,
+                # Regime
+                **regime,
+                # Time/cycle
+                **time_feats,
+            }
+
+            rows.append(record)
 
     return pl.DataFrame(rows)
-
 
 # ── Entry point ───────────────────────────────────────────────────────────────
 
 def main():
     trades, prices, funds = load_data()
-
-    # Build label column
     trades = build_labels(trades)
 
-    # Log class balance
     total    = len(trades)
     positive = trades["label"].sum()
     log.info(f"Label distribution: {positive}/{total} positive ({positive/total*100:.1f}%)")
 
-    # Build feature dataset
-    log.info("Building feature dataset — this will take a few minutes...")
+    log.info("Building feature dataset — this will take several minutes...")
     dataset = build_dataset(trades, prices, funds)
 
-    # Drop rows with too many nulls — need at least price features
-    dataset = dataset.drop_nulls(subset=["momentum_6m", "above_200ma", "rsi_14"])
+    log.info(f"Raw dataset shape: {dataset.shape}")
 
-    log.info(f"Dataset shape after dropping nulls: {dataset.shape}")
+    # Cap revenue growth outliers
+    if "revenue_growth_yoy" in dataset.columns:
+        dataset = dataset.with_columns(
+            pl.col("revenue_growth_yoy").clip(-100, 500)
+        )
+
+    # Drop rows missing core price features
+    core = [c for c in ["momentum_6m", "above_200ma", "rsi_14"] if c in dataset.columns]
+    if core:
+        dataset = dataset.drop_nulls(subset=core)
+
+    log.info(f"Final dataset shape: {dataset.shape}")
     log.info(f"Final label balance: {dataset['label'].sum()}/{len(dataset)}")
 
     # Save
@@ -343,18 +268,20 @@ def main():
     dataset.write_parquet(OUTPUT_FILE)
     log.info(f"Saved to {OUTPUT_FILE}")
 
-    # Print feature summary
-    print("\nFeature summary:")
-    print(dataset.describe())
-
+    # Summary
     print("\nLabel distribution:")
     print(dataset["label"].value_counts())
 
-    print("\nTop 10 rows:")
+    print(f"\nAll features ({len(dataset.columns)} total):")
+    for col in sorted(dataset.columns):
+        null_pct = dataset[col].null_count() / len(dataset) * 100
+        print(f"  {col:<40} nulls: {null_pct:.1f}%")
+
+    print("\nSample rows:")
     print(dataset.select([
-        "ticker", "signal_date", "label", "alpha",
-        "score", "momentum_6m", "above_200ma", "gross_margin"
-    ]).head(10))
+        "ticker", "signal_date", "label", "alpha", "score",
+        "momentum_6m", "stock_vol_20d", "market_vol_20d", "month"
+    ]).head(5))
 
 
 if __name__ == "__main__":
