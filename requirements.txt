@@ -8,3 +8,5 @@ mlflow
 lxml
 html5lib
 pytest
+scipy
+arch
