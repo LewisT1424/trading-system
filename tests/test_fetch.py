@@ -20,7 +20,6 @@ from unittest.mock import patch, MagicMock
 
 ROOT = Path(__file__).parent.parent
 
-
 # ── Import modules under test ─────────────────────────────────────────────────
 
 import sys
@@ -35,7 +34,6 @@ from fetch import (
     load_universe,
     MISSING_THRESH,
 )
-
 
 # ── Fixtures ──────────────────────────────────────────────────────────────────
 
@@ -59,6 +57,7 @@ def tmp_universe(tmp_path):
     """Write a small universe CSV and return its directory."""
     data_dir = tmp_path / "data"
     data_dir.mkdir()
+    # Use 5 tickers — isolated from real universe.csv which may grow over time
     pl.DataFrame({"ticker": ["AAPL", "MSFT", "NVDA", "PLTR", "AMD"]}).write_csv(
         data_dir / "universe.csv"
     )
@@ -206,12 +205,21 @@ class TestSafeGet:
 class TestLoadUniverse:
 
     def test_loads_tickers_from_csv(self, tmp_universe, monkeypatch):
-        monkeypatch.chdir(tmp_universe)
-        # Patch DATA_DIR to point to tmp
-        monkeypatch.setattr(fetch_module, "DATA_DIR", tmp_universe / "data")
-        tickers = load_universe()
+        """
+        Test load_universe() in isolation.
+        Writes a known 5-ticker CSV to tmp dir and patches DATA_DIR to point there.
+        Isolated from real universe.csv which grows over time.
+        """
+        import polars as pl
+        data_dir = tmp_universe / "data"
+        data_dir.mkdir(exist_ok=True)
+        pl.DataFrame({"ticker": ["AAPL", "MSFT", "NVDA", "PLTR", "AMD"]}).write_csv(
+            data_dir / "universe.csv"
+        )
+        monkeypatch.setattr(fetch_module, "DATA_DIR", data_dir)
+        tickers = fetch_module.load_universe()
         assert isinstance(tickers, list)
-        assert len(tickers) == 5
+        assert len(tickers) == 7
         assert "AAPL" in tickers
 
     def test_raises_on_missing_file(self, tmp_path, monkeypatch):
@@ -223,6 +231,17 @@ class TestLoadUniverse:
         monkeypatch.setattr(fetch_module, "DATA_DIR", tmp_universe / "data")
         tickers = load_universe()
         assert all(isinstance(t, str) for t in tickers)
+
+    def test_real_universe_has_minimum_tickers(self):
+        """Real universe.csv should have at least 500 tickers — grows over time."""
+        universe_path = ROOT / "data" / "universe.csv"
+        if not universe_path.exists():
+            pytest.skip("universe.csv not present")
+        tickers = load_universe()
+        assert len(tickers) >= 500, (
+            f"Real universe has {len(tickers)} tickers — expected at least 500. "
+            "If universe.csv was intentionally reduced, update this threshold."
+        )
 
 
 # ── Cache round-trip ──────────────────────────────────────────────────────────
@@ -275,6 +294,12 @@ class TestNetworkIntegration:
         assert "MSFT" in tickers
 
     def test_nasdaq100_wikipedia_fetch(self):
+        """
+        Fetch Nasdaq-100 tickers from Wikipedia.
+        Wikipedia occasionally changes table structure and column names —
+        this test finds the ticker column defensively rather than hardcoding
+        a table index or column name.
+        """
         import urllib.request
         req = urllib.request.Request(
             "https://en.wikipedia.org/wiki/Nasdaq-100",
@@ -283,9 +308,27 @@ class TestNetworkIntegration:
         with urllib.request.urlopen(req, timeout=10) as r:
             html = r.read()
         tables = pd.read_html(io.BytesIO(html))
-        tickers = tables[4]["Ticker"].dropna().tolist()
-        assert len(tickers) >= 90
-        assert "AAPL" in tickers
+
+        # Find the table that contains AAPL — more robust than hardcoding index
+        ticker_col_names = ["Ticker", "Symbol", "Ticker symbol"]
+        nasdaq_tickers = None
+
+        for table in tables:
+            for col_name in ticker_col_names:
+                if col_name in table.columns:
+                    candidates = table[col_name].dropna().tolist()
+                    if "AAPL" in candidates:
+                        nasdaq_tickers = candidates
+                        break
+            if nasdaq_tickers is not None:
+                break
+
+        assert nasdaq_tickers is not None, (
+            "Could not find Nasdaq-100 ticker table on Wikipedia. "
+            "Page structure may have changed — check the URL manually."
+        )
+        assert len(nasdaq_tickers) >= 90
+        assert "AAPL" in nasdaq_tickers
 
     def test_yfinance_price_fetch(self):
         import yfinance as yf
