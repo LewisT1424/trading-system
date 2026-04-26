@@ -1,12 +1,34 @@
-yfinance
+# Core data
+numpy
+pandas
 polars
-streamlit
-plotly
+
+# Finance data
+yfinance
+
+# Web / API
 requests
 certifi
-mlflow
 lxml
 html5lib
-pytest
+
+# Visualisation
+matplotlib
+plotly
+streamlit
+
+# Backtesting / statistics
 scipy
+statsmodels
 arch
+
+# ML
+xgboost
+scikit-learn
+mlflow
+
+# Testing
+pytest
+
+# Utilities
+setuptools
