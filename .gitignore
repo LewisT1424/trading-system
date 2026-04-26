@@ -22,3 +22,11 @@ mlruns/
 
 # Streamlit
 .streamlit/
+
+# Personal financial data
+data/raw/
+
+# Strategy-sensitive outputs
+research/fama_french/a6m_monthly_returns.parquet
+research/fama_french/spanning_test_results.parquet
+research/data/ml_labels.parquet
