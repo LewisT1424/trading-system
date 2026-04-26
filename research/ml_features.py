@@ -213,21 +213,32 @@ def build_dataset(
 
             record = {
                 # Identifiers
-                "ticker":      ticker,
-                "signal_date": signal_date,
-                "label":       row["label"],
-                "alpha":       row["alpha"],
-                "score":       row["score"],
+                "ticker":           ticker,
+                "signal_date":      signal_date,
+                "label":            row["label"],
+                "alpha":            row["alpha"],
+                "score":            row["score"],
                 # Price features
-                **pf_ticker,
-                # Fundamental features
-                **ff_ticker,
+                "above_200ma":         pf_ticker.get("above_200ma"),
+                "pct_below_52w_high":  pf_ticker.get("pct_below_52w_high"),
+                "in_dip":              pf_ticker.get("in_dip"),
+                "rsi_14":              pf_ticker.get("rsi_14"),
+                "momentum_6m":         pf_ticker.get("momentum_6m"),
+                "momentum_3m":         pf_ticker.get("momentum_3m"),
+                "momentum_1m":         pf_ticker.get("momentum_1m"),
+                "momentum_1w":         pf_ticker.get("momentum_1w"),
                 # Volatility
-                **vol_feats,
+                "stock_vol_20d":    vol_feats.get("stock_vol_20d"),
+                "stock_vol_63d":    vol_feats.get("stock_vol_63d"),
+                "vol_ratio":        vol_feats.get("vol_ratio"),
                 # Regime
-                **regime,
-                # Time/cycle
-                **time_feats,
+                "market_vol_20d":   regime.get("market_vol_20d"),
+                "spy_momentum_3m":  regime.get("spy_momentum_3m"),
+                "spy_momentum_1m":  regime.get("spy_momentum_1m"),
+                "market_drawdown":  regime.get("market_drawdown"),
+                # Time
+                "month":            time_feats.get("month"),
+                "year_normalized":  time_feats.get("year_normalized"),
             }
 
             rows.append(record)
