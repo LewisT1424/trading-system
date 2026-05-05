@@ -255,5 +255,3 @@ research/fama_french/
 Being able to discuss these results precisely matters in the fund role context. The right framing:
 
 *"I tested A_6M against the Fama-French three-factor model on 182 months of backtest data. Alpha is +4.1% annualised with a t-statistic of 1.571 — positive and economically meaningful but not yet statistically significant at this sample size. Market beta is 0.96, consistent with a concentrated large-cap momentum strategy. There's a small but significant SMB loading of 0.22, which suggests the screener naturally gravitates toward the smaller end of the S&P 500. The value loading is near zero, consistent with a style-agnostic momentum approach. R-squared is 0.70 — the factors explain 70% of return variation, with the remaining 30% being alpha and idiosyncratic noise. The next step is accumulating live paper trading data to re-run the test on clean out-of-sample returns."*
-
-That answer distinguishes someone who understands what they built from someone who just ran a backtest.
